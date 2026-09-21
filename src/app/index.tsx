@@ -2,26 +2,31 @@ import { FontAwesome5, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 import * as Speech from "expo-speech";
 import { useEffect, useRef, useState } from "react";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import {
-  Alert,
-  Animated,
-  Dimensions,
-  Modal,
-  Platform,
-  ScrollView,
-  StatusBar,
-  StyleSheet,
-  Switch,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    Alert,
+    Animated,
+    Dimensions,
+    Modal,
+    Platform,
+    ScrollView,
+    StatusBar,
+    StyleSheet,
+    Switch,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from "react-native";
-import MapView, { LatLng, Marker, Polyline, Region } from "react-native-maps";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { WebView } from "react-native-webview";
 
-type ActivityType = "Joging" | "Lari" | "Bersepeda" | "Berenang";
+type ActivityType = "Joging" | "Lari" | "Bersepeda";
 type Gender = "Pria" | "Wanita";
+
+type LatLng = {
+  latitude: number;
+  longitude: number;
+};
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
@@ -29,15 +34,183 @@ const MET_VALUES: Record<ActivityType, number> = {
   Joging: 7.0,
   Lari: 9.8,
   Bersepeda: 8.0,
-  Berenang: 5.8,
 };
 
-const DEFAULT_REGION: Region = {
+const DEFAULT_REGION = {
   latitude: -7.250445,
   longitude: 112.768845,
-  latitudeDelta: 0.08,
-  longitudeDelta: 0.08,
 };
+
+const LEAFLET_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+  />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <style>
+    html,
+    body,
+    #map {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      overflow: hidden;
+    }
+
+    .leaflet-control-attribution {
+      font-size: 8px;
+    }
+
+    .user-marker-wrap {
+      width: 38px;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: rgba(37, 99, 235, 0.16);
+    }
+
+    .user-arrow {
+      width: 30px;
+      height: 30px;
+      transform-origin: 50% 50%;
+      transition: transform 0.25s ease-out;
+      filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.35));
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    const map = L.map("map", {
+      zoomControl: true,
+      attributionControl: true,
+      touchZoom: true,
+      doubleClickZoom: true,
+      dragging: true,
+      scrollWheelZoom: true
+    }).setView(
+      [${DEFAULT_REGION.latitude}, ${DEFAULT_REGION.longitude}],
+      13
+    );
+
+    L.tileLayer(
+      "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap contributors"
+      }
+    ).addTo(map);
+
+    const userIcon = L.divIcon({
+      className: "",
+      html: '<div class="user-marker-wrap"><svg id="user-arrow" class="user-arrow" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" aria-label="Posisi kamu"><path d="M20 2 L37 36 L20 28 L3 36 Z" fill="#2563EB" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round"/><circle cx="20" cy="23" r="2.5" fill="#FFFFFF"/></svg></div>', 
+      iconSize: [38, 38],
+      iconAnchor: [19, 19]
+    });
+
+    let userMarker = null;
+
+    const routeLine = L.polyline([], {
+      color: "#2563EB",
+      weight: 5,
+      opacity: 0.9,
+      lineCap: "round",
+      lineJoin: "round"
+    }).addTo(map);
+
+    let userChangedMap = false;
+    let firstLocationShown = false;
+
+    map.on("zoomstart", function() {
+      userChangedMap = true;
+    });
+
+    map.on("dragstart", function() {
+      userChangedMap = true;
+    });
+
+    function updateMap(latitude, longitude, routeData, shouldFollow, heading) {
+      const point = [latitude, longitude];
+
+      if (!userMarker) {
+        userMarker = L.marker(point, {
+          icon: userIcon
+        }).addTo(map);
+      } else {
+        userMarker.setLatLng(point);
+      }
+
+      const arrow = document.getElementById("user-arrow");
+      if (arrow && typeof heading === "number" && Number.isFinite(heading)) {
+        arrow.style.transform = "rotate(" + heading + "deg)";
+      }
+
+      if (Array.isArray(routeData)) {
+        const coordinates = routeData.map(function(item) {
+          return [item.latitude, item.longitude];
+        });
+
+        routeLine.setLatLngs(coordinates);
+      }
+
+      if (shouldFollow && !userChangedMap) {
+        const targetZoom = map.getZoom() < 16 ? 17 : map.getZoom();
+        map.setView(point, targetZoom, {
+          animate: true,
+          duration: 0.5
+        });
+      } else if (shouldFollow && !firstLocationShown) {
+        map.setView(point, 17, {
+          animate: true,
+          duration: 0.5
+        });
+      }
+
+      firstLocationShown = true;
+    }
+
+    function resetMap() {
+      if (userMarker) {
+        map.removeLayer(userMarker);
+        userMarker = null;
+      }
+
+      routeLine.setLatLngs([]);
+      userChangedMap = false;
+      firstLocationShown = false;
+
+      map.setView(
+        [${DEFAULT_REGION.latitude}, ${DEFAULT_REGION.longitude}],
+        13
+      );
+    }
+
+    if (typeof L === "undefined") {
+      document.getElementById("map").innerHTML =
+        '<div style="height:100%;display:flex;align-items:center;justify-content:center;background:#E2E8F0;color:#475569;font:600 14px Arial;text-align:center;padding:20px;box-sizing:border-box;">Peta gagal dimuat. Periksa koneksi internet lalu coba lagi.</div>';
+    } else if (window.ReactNativeWebView) {
+      window.ReactNativeWebView.postMessage("LEAFLET_READY");
+    }
+  </script>
+</body>
+</html>
+`;
 
 export default function App() {
   // ================= PROFIL =================
@@ -62,6 +235,8 @@ export default function App() {
   const [activityType, setActivityType] = useState<ActivityType>("Joging");
   const [distance, setDistance] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [activeDuration, setActiveDuration] = useState(0);
+  const [isMoving, setIsMoving] = useState(false);
   const [calories, setCalories] = useState(0);
   const [currentLocation, setCurrentLocation] = useState<LatLng | null>(null);
   const [route, setRoute] = useState<LatLng[]>([]);
@@ -73,8 +248,13 @@ export default function App() {
   const lastLocation = useRef<LatLng | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number | null>(null);
-  const mapRef = useRef<MapView | null>(null);
+  const webViewRef = useRef<WebView | null>(null);
+  const [leafletReady, setLeafletReady] = useState(false);
+  const [heading, setHeading] = useState(0);
+  const lastHeadingRef = useRef(0);
   const lastSpokenKmRef = useRef(0);
+  const isMovingRef = useRef(false);
+  const movingSamplesRef = useRef(0);
 
   const theme = isDark
     ? {
@@ -255,15 +435,18 @@ export default function App() {
     return R * c;
   };
 
-  const centerMapOnLocation = (location: LatLng) => {
-    mapRef.current?.animateToRegion(
-      {
-        ...location,
-        latitudeDelta: 0.005,
-        longitudeDelta: 0.005,
-      },
-      500
-    );
+  const getBearing = (from: LatLng, to: LatLng) => {
+    const lat1 = (from.latitude * Math.PI) / 180;
+    const lat2 = (to.latitude * Math.PI) / 180;
+    const dLon = ((to.longitude - from.longitude) * Math.PI) / 180;
+
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x =
+      Math.cos(lat1) * Math.sin(lat2) -
+      Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+
+    const bearing = (Math.atan2(y, x) * 180) / Math.PI;
+    return (bearing + 360) % 360;
   };
 
   const speakDistance = (km: number) => {
@@ -276,10 +459,32 @@ export default function App() {
     });
   };
 
+  useEffect(() => {
+    if (!leafletReady || !currentLocation) return;
+
+    const routeJson = JSON.stringify(route);
+
+    webViewRef.current?.injectJavaScript(`
+      if (typeof updateMap === "function") {
+        updateMap(
+          ${currentLocation.latitude},
+          ${currentLocation.longitude},
+          ${routeJson},
+          ${isTracking},
+          ${heading}
+        );
+      }
+      true;
+    `);
+  }, [leafletReady, currentLocation, route, isTracking, heading]);
+
   const startTracking = async () => {
     if (isTracking) return;
 
     lastSpokenKmRef.current = 0;
+    isMovingRef.current = false;
+    movingSamplesRef.current = 0;
+    setIsMoving(false);
 
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
@@ -317,13 +522,24 @@ export default function App() {
       setCurrentLocation(firstPoint);
       setRoute([firstPoint]);
       lastLocation.current = firstPoint;
-      centerMapOnLocation(firstPoint);
+
+      const firstHeading = first.coords.heading;
+      const initialHeading =
+        typeof firstHeading === "number" && firstHeading >= 0
+          ? firstHeading
+          : 0;
+
+      lastHeadingRef.current = initialHeading;
+      setHeading(initialHeading);
 
       setDistance(0);
       setDuration(0);
+      setActiveDuration(0);
       setCalories(0);
+      movingSamplesRef.current = 0;
+      isMovingRef.current = false;
       setIsTracking(true);
-      setLocationStatus("GPS aktif • Sedang merekam");
+      setLocationStatus("GPS aktif • Menunggu gerakan");
 
       startTimeRef.current = Date.now();
 
@@ -334,6 +550,10 @@ export default function App() {
           );
 
           setDuration(elapsed);
+
+          if (isMovingRef.current) {
+            setActiveDuration((prev) => prev + 1);
+          }
         }
       }, 1000);
 
@@ -357,8 +577,56 @@ export default function App() {
               point.longitude
             );
 
+            const speed = newLocation.coords.speed;
+            const accuracy = newLocation.coords.accuracy;
+
+            const hasGoodAccuracy = accuracy == null || accuracy <= 25;
+            const movingBySpeed = speed !== null && speed >= 0.5;
+            const movingByDistance =
+              (speed === null || speed < 0) && dist >= 0.005;
+
+            const rawMoving =
+              hasGoodAccuracy && (movingBySpeed || movingByDistance);
+
+            if (rawMoving) {
+              movingSamplesRef.current = Math.min(
+                movingSamplesRef.current + 1,
+                3
+              );
+            } else {
+              movingSamplesRef.current = 0;
+            }
+
+            // Butuh dua pembacaan GPS berturut-turut agar perpindahan kecil
+            // akibat noise GPS saat diam tidak langsung dianggap gerakan.
+            const isMoving = rawMoving && movingSamplesRef.current >= 2;
+
+            isMovingRef.current = isMoving;
+            setIsMoving(isMoving);
+
+            if (isMoving) {
+              const gpsHeading = newLocation.coords.heading;
+
+              let nextHeading = lastHeadingRef.current;
+
+              if (typeof gpsHeading === "number" && gpsHeading >= 0) {
+                nextHeading = gpsHeading;
+              } else if (dist >= 0.005) {
+                nextHeading = getBearing(lastLocation.current, point);
+              }
+
+              lastHeadingRef.current = nextHeading;
+              setHeading(nextHeading);
+            }
+
+            setLocationStatus(
+              isMoving
+                ? "GPS aktif • Sedang bergerak"
+                : "GPS aktif • Menunggu gerakan"
+            );
+
             // Abaikan lonjakan GPS yang tidak wajar.
-            if (dist <= 0.2) {
+            if (isMoving && dist <= 0.2) {
               setDistance((prev) => {
                 const newDistance = prev + dist;
                 const currentKm = Math.floor(newDistance);
@@ -391,22 +659,15 @@ export default function App() {
               });
             }
           } else {
+            isMovingRef.current = false;
+            movingSamplesRef.current = 0;
+            setIsMoving(false);
+            setLocationStatus("GPS aktif • Menunggu gerakan");
             setRoute([point]);
           }
 
           lastLocation.current = point;
           setCurrentLocation(point);
-
-          // Kamera mengikuti posisi GPS terbaru.
-          mapRef.current?.animateToRegion(
-            {
-              latitude: point.latitude,
-              longitude: point.longitude,
-              latitudeDelta: 0.0015,
-              longitudeDelta: 0.0015,
-            },
-            500
-          );
         }
       );
 
@@ -423,6 +684,9 @@ export default function App() {
 
   const stopTracking = () => {
     setIsTracking(false);
+    isMovingRef.current = false;
+    movingSamplesRef.current = 0;
+    setIsMoving(false);
 
     if (startTimeRef.current !== null) {
       const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
@@ -448,23 +712,34 @@ export default function App() {
     startTimeRef.current = null;
     setDistance(0);
     lastSpokenKmRef.current = 0;
+    lastHeadingRef.current = 0;
+    setHeading(0);
     setDuration(0);
+    setActiveDuration(0);
     setCalories(0);
     setRoute([]);
     setCurrentLocation(null);
+
+    webViewRef.current?.injectJavaScript(`
+      if (typeof resetMap === "function") {
+        resetMap();
+      }
+      true;
+    `);
+
     setLocationStatus("Lokasi belum aktif");
   };
 
   useEffect(() => {
-    if (duration > 0) {
+    if (activeDuration > 0) {
       const userWeight = parseFloat(weight) > 0 ? parseFloat(weight) : 60;
-      const hours = duration / 3600;
+      const hours = activeDuration / 3600;
       const met = MET_VALUES[activityType];
       setCalories(met * userWeight * hours);
     } else {
       setCalories(0);
     }
-  }, [duration, activityType, weight]);
+  }, [activeDuration, activityType, weight]);
 
   useEffect(() => {
     return () => {
@@ -472,6 +747,8 @@ export default function App() {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
+      isMovingRef.current = false;
+      movingSamplesRef.current = 0;
     };
   }, []);
 
@@ -776,57 +1053,54 @@ export default function App() {
             ))}
           </ScrollView>
 
+          {/* ================= STATUS GPS ================= */}
+          <View
+            style={[
+              styles.trackingStatusBox,
+              {
+                backgroundColor: theme.soft,
+                borderColor: theme.border,
+              },
+            ]}
+          >
+            <View
+              style={[
+                styles.statusDot,
+                {
+                  backgroundColor: isMoving ? "#22C55E" : isTracking ? "#F59E0B" : "#94A3B8",
+                },
+              ]}
+            />
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.trackingStatusTitle, { color: theme.text }]}>
+                {isTracking
+                  ? isMoving
+                    ? "Sedang bergerak"
+                    : "Tidak bergerak"
+                  : "Pelacakan belum dimulai"}
+              </Text>
+              <Text style={[styles.trackingStatusText, { color: theme.muted }]}>
+                {locationStatus}
+              </Text>
+            </View>
+          </View>
+
           {/* ================= LIVE MAP ================= */}
           <View style={styles.mapContainer}>
-            <MapView
-              ref={mapRef}
+            <WebView
+              ref={webViewRef}
+              source={{ html: LEAFLET_HTML, baseUrl: "https://example.com" }}
               style={styles.map}
-              mapType="standard"
-              initialRegion={DEFAULT_REGION}
-              showsUserLocation={true}
-              showsMyLocationButton={false}
-              followsUserLocation={isTracking}
-              showsCompass={true}
-              showsScale={true}
-              showsBuildings={true}
-              loadingEnabled={true}
-            >
-              {/* Garis rute olahraga yang mengikuti GPS */}
-              {route.length > 1 && (
-                <Polyline
-                  coordinates={route}
-                  strokeColor="#00C853"
-                  strokeWidth={6}
-                  lineCap="round"
-                  lineJoin="round"
-                  geodesic={true}
-                />
-              )}
-
-              {/* Marker posisi GPS saat ini */}
-              {currentLocation && (
-                <Marker
-                  coordinate={currentLocation}
-                  title="Posisi kamu"
-                  anchor={{ x: 0.5, y: 0.5 }}
-                  flat={true}
-                >
-                  <View style={styles.currentLocationMarker}>
-                    <View style={styles.currentLocationDot} />
-                  </View>
-                </Marker>
-              )}
-            </MapView>
-
-            <View style={styles.mapStatus}>
-              <View
-                style={[
-                  styles.statusDot,
-                  { backgroundColor: isTracking ? "#22C55E" : "#94A3B8" },
-                ]}
-              />
-              <Text style={styles.mapStatusText}>{locationStatus}</Text>
-            </View>
+              originWhitelist={["*"]}
+              javaScriptEnabled
+              domStorageEnabled
+              scrollEnabled={false}
+              onMessage={(event) => {
+                if (event.nativeEvent.data === "LEAFLET_READY") {
+                  setLeafletReady(true);
+                }
+              }}
+            />
           </View>
 
           <View
@@ -896,8 +1170,9 @@ export default function App() {
               color="#2563EB"
             />
             <Text style={[styles.gpsInfoText, { color: theme.muted }]}>
-              Peta menampilkan posisi dan jalur yang terdeteksi GPS saat
-              pelacakan aktif.
+              GPS digunakan untuk menghitung jarak dan aktivitas. Peta OpenStreetMap
+              menampilkan posisi berbentuk panah dan jalur biru sesuai pergerakan.
+              Gunakan kontrol zoom atau cubit peta untuk memperbesar dan memperkecil.
             </Text>
           </View>
         </View>
@@ -1284,8 +1559,26 @@ const styles = StyleSheet.create({
   activityTextActive: {
     color: "#fff",
   },
+  trackingStatusBox: {
+    minHeight: 58,
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingHorizontal: 13,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  trackingStatusTitle: {
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  trackingStatusText: {
+    fontSize: 10,
+    marginTop: 2,
+  },
   mapContainer: {
-    height: 260,
+    height: 360,
     borderRadius: 14,
     overflow: "hidden",
     marginBottom: 14,
@@ -1294,56 +1587,11 @@ const styles = StyleSheet.create({
     width: "100%",
     height: "100%",
   },
-  mapStatus: {
-    position: "absolute",
-    top: 10,
-    left: 10,
-    right: 10,
-    backgroundColor: "rgba(15, 23, 42, 0.88)",
-    borderRadius: 9,
-    paddingHorizontal: 11,
-    paddingVertical: 8,
-    flexDirection: "row",
-    alignItems: "center",
-  },
   statusDot: {
     width: 8,
     height: 8,
     borderRadius: 4,
     marginRight: 7,
-  },
-  mapStatusText: {
-    color: "#fff",
-    fontSize: 11,
-    fontWeight: "700",
-  },
-  locationMarker: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    backgroundColor: "#2563EB",
-    borderWidth: 3,
-    borderColor: "#fff",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  currentLocationMarker: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: "rgba(0, 200, 83, 0.25)",
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: "rgba(0, 200, 83, 0.5)",
-  },
-  currentLocationDot: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: "#00C853",
-    borderWidth: 3,
-    borderColor: "#FFFFFF",
   },
   statsContainer: {
     flexDirection: "row",
