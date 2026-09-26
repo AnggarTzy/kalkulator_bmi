@@ -357,6 +357,19 @@ export default function App() {
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const backgroundTrackingRef = useRef(false);
 
+  // ================= TEST TTS (hapus kalau sudah yakin TTS jalan) =================
+  useEffect(() => {
+    console.log("TEST TTS: mulai");
+    Speech.speak("Tes suara IFit satu dua tiga", {
+      language: "id-ID",
+      rate: 0.9,
+      onStart: () => console.log("TTS: mulai bicara"),
+      onDone: () => console.log("TTS: selesai"),
+      onStopped: () => console.log("TTS: dihentikan"),
+      onError: (e) => console.log("TTS error:", e),
+    });
+  }, []);
+
   const theme = isDark
     ? {
         background: "#0F172A",
@@ -828,20 +841,26 @@ export default function App() {
                 : "GPS aktif • Menunggu gerakan"
             );
 
-            // Abaikan lonjakan GPS yang tidak wajar.
-            if (isMoving && dist <= 0.2) {
+            // Akumulasi jarak walau sesaat "tidak bergerak",
+            // biar notif 1 km tidak ke-skip saat berhenti di lampu merah.
+            if (hasGoodAccuracy && dist <= 0.2) {
               const newDistance = distanceRef.current + dist;
               distanceRef.current = newDistance;
               setDistance(newDistance);
+            }
 
-              const currentKm = Math.floor(newDistance);
-              if (currentKm > lastSpokenKmRef.current && currentKm >= 1) {
-                lastSpokenKmRef.current = currentKm;
-                void speakDistance(currentKm);
-              }
+            // Cek notif 1 km TERPISAH dari kondisi isMoving.
+            const currentKm = Math.floor(distanceRef.current);
+            if (currentKm > lastSpokenKmRef.current && currentKm >= 1) {
+              lastSpokenKmRef.current = currentKm;
+              console.log("TRIGGER TTS:", currentKm, "km");
+              void speakDistance(currentKm);
+            }
 
+            // Simpan titik rute hanya saat benar-benar bergerak,
+            // biar garis tidak penuh noise GPS saat diam.
+            if (isMoving && dist <= 0.2) {
               setRoute((prev) => {
-                // Hindari titik yang terlalu dekat agar garis tetap rapi.
                 if (prev.length > 0) {
                   const lastPoint = prev[prev.length - 1];
                   const pointDistance = getDistance(
