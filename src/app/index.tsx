@@ -1,7 +1,11 @@
 import { FontAwesome5, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 import * as Speech from "expo-speech";
+import * as TaskManager from "expo-task-manager";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useRef, useState } from "react";
+import { AppState } from "react-native";
+import type { AppStateStatus } from "react-native";
 import {
     Alert,
     Animated,
@@ -40,6 +44,99 @@ const DEFAULT_REGION = {
   latitude: -7.250445,
   longitude: 112.768845,
 };
+
+const BACKGROUND_LOCATION_TASK = "IFIT_BACKGROUND_LOCATION";
+const TRACKER_STORAGE_KEY = "@ifit_tracker_state";
+
+type StoredTrackerState = {
+  tracking: boolean;
+  activityType: ActivityType;
+  weight: number;
+  distance: number;
+  activeDuration: number;
+  lastLocation: LatLng | null;
+  lastTimestamp: number | null;
+};
+
+const getDistanceKm = (
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+) => {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * (Math.PI / 180);
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * (Math.PI / 180)) *
+      Math.cos(lat2 * (Math.PI / 180)) *
+      Math.sin(dLon / 2) ** 2;
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+};
+
+if (!TaskManager.isTaskDefined(BACKGROUND_LOCATION_TASK)) {
+  TaskManager.defineTask(
+    BACKGROUND_LOCATION_TASK,
+    async ({ data, error }) => {
+      if (error) return;
+      const locations = (data as { locations?: Location.LocationObject[] })
+        ?.locations;
+
+      if (!locations?.length) return;
+
+      try {
+        const raw = await AsyncStorage.getItem(TRACKER_STORAGE_KEY);
+        if (!raw) return;
+
+        const state: StoredTrackerState = JSON.parse(raw);
+        if (!state.tracking) return;
+
+        let next = { ...state };
+        const lastGps = locations[locations.length - 1];
+        const point = {
+          latitude: lastGps.coords.latitude,
+          longitude: lastGps.coords.longitude,
+        };
+        const timestamp = lastGps.timestamp || Date.now();
+
+        if (next.lastLocation && next.lastTimestamp) {
+          const dist = getDistanceKm(
+            next.lastLocation.latitude,
+            next.lastLocation.longitude,
+            point.latitude,
+            point.longitude
+          );
+
+          const speed = lastGps.coords.speed;
+          const accuracy = lastGps.coords.accuracy;
+          const hasGoodAccuracy = accuracy == null || accuracy <= 30;
+          const movingBySpeed = speed != null && speed >= 0.5;
+          const movingByDistance =
+            (speed == null || speed < 0) && dist >= 0.005;
+          const moving = hasGoodAccuracy && (movingBySpeed || movingByDistance);
+
+          if (moving && dist <= 0.2) {
+            next.distance += dist;
+            const elapsed = Math.max(
+              0,
+              Math.floor((timestamp - next.lastTimestamp) / 1000)
+            );
+            next.activeDuration += Math.min(elapsed, 30);
+          }
+        }
+
+        next.lastLocation = point;
+        next.lastTimestamp = timestamp;
+
+        await AsyncStorage.setItem(
+          TRACKER_STORAGE_KEY,
+          JSON.stringify(next)
+        );
+      } catch {}
+    }
+  );
+}
 
 const LEAFLET_HTML = `
 <!DOCTYPE html>
@@ -238,6 +335,7 @@ export default function App() {
   const [activeDuration, setActiveDuration] = useState(0);
   const [isMoving, setIsMoving] = useState(false);
   const [calories, setCalories] = useState(0);
+  const [pace, setPace] = useState(0);
   const [currentLocation, setCurrentLocation] = useState<LatLng | null>(null);
   const [route, setRoute] = useState<LatLng[]>([]);
   const [locationStatus, setLocationStatus] = useState("Lokasi belum aktif");
@@ -253,8 +351,11 @@ export default function App() {
   const [heading, setHeading] = useState(0);
   const lastHeadingRef = useRef(0);
   const lastSpokenKmRef = useRef(0);
+  const distanceRef = useRef(0);
   const isMovingRef = useRef(false);
   const movingSamplesRef = useRef(0);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const backgroundTrackingRef = useRef(false);
 
   const theme = isDark
     ? {
@@ -449,14 +550,20 @@ export default function App() {
     return (bearing + 360) % 360;
   };
 
-  const speakDistance = (km: number) => {
-    Speech.stop();
-    Speech.speak(`Jarak sudah ${km} kilometer`, {
-      language: "id-ID",
-      rate: 0.9,
-      pitch: 1.0,
-      volume: 1.0,
-    });
+  const speakDistance = async (km: number) => {
+    try {
+      const speaking = await Speech.isSpeakingAsync();
+      if (speaking) {
+        await Speech.stop();
+      }
+
+      Speech.speak(`Jarak sudah ${km} kilometer`, {
+        language: "id-ID",
+        rate: 0.9,
+        pitch: 1.0,
+        volume: 1.0,
+      });
+    } catch {}
   };
 
   useEffect(() => {
@@ -478,6 +585,80 @@ export default function App() {
     `);
   }, [leafletReady, currentLocation, route, isTracking, heading]);
 
+  const saveTrackerState = async (overrides: Partial<StoredTrackerState> = {}) => {
+    const state: StoredTrackerState = {
+      tracking: isTracking,
+      activityType,
+      weight: parseFloat(weight) > 0 ? parseFloat(weight) : 60,
+      distance,
+      activeDuration,
+      lastLocation: lastLocation.current,
+      lastTimestamp: Date.now(),
+      ...overrides,
+    };
+
+    try {
+      await AsyncStorage.setItem(TRACKER_STORAGE_KEY, JSON.stringify(state));
+    } catch {}
+  };
+
+  const startBackgroundLocation = async () => {
+    try {
+      const alreadyStarted =
+        await Location.hasStartedLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+
+      if (!alreadyStarted) {
+        await Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
+          accuracy: Location.Accuracy.High,
+          timeInterval: 1000,
+          distanceInterval: 1,
+          pausesUpdatesAutomatically: false,
+          showsBackgroundLocationIndicator: true,
+          foregroundService: {
+            notificationTitle: "IFit sedang merekam aktivitas",
+            notificationBody: "GPS tetap aktif untuk menghitung jarak dan kalori.",
+            notificationColor: "#2563EB",
+          },
+        });
+      }
+
+      backgroundTrackingRef.current = true;
+    } catch {}
+  };
+
+  const stopBackgroundLocation = async () => {
+    try {
+      const started =
+        await Location.hasStartedLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+
+      if (started) {
+        await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+      }
+    } catch {}
+
+    backgroundTrackingRef.current = false;
+  };
+
+  const syncBackgroundTracker = async () => {
+    try {
+      const raw = await AsyncStorage.getItem(TRACKER_STORAGE_KEY);
+      if (!raw) return;
+
+      const state: StoredTrackerState = JSON.parse(raw);
+      if (!state.tracking) return;
+
+      setDistance(state.distance);
+      distanceRef.current = state.distance;
+      lastSpokenKmRef.current = Math.floor(state.distance);
+      setActiveDuration(state.activeDuration);
+
+      if (state.lastLocation) {
+        lastLocation.current = state.lastLocation;
+        setCurrentLocation(state.lastLocation);
+      }
+    } catch {}
+  };
+
   const startTracking = async () => {
     if (isTracking) return;
 
@@ -496,6 +677,16 @@ export default function App() {
           "Aktifkan izin lokasi agar IFit dapat memantau jarak dan menampilkan posisi pada peta."
         );
         return;
+      }
+
+      if (Platform.OS === "android") {
+        const bgStatus = await Location.requestBackgroundPermissionsAsync();
+        if (bgStatus.status !== "granted") {
+          Alert.alert(
+            "Lokasi Latar Belakang",
+            "Agar GPS tetap merekam saat layar HP dikunci, izinkan akses lokasi di latar belakang. Jika ditolak, IFit tetap bisa digunakan saat aplikasi terbuka."
+          );
+        }
       }
 
       const enabled = await Location.hasServicesEnabledAsync();
@@ -533,15 +724,27 @@ export default function App() {
       setHeading(initialHeading);
 
       setDistance(0);
+      distanceRef.current = 0;
       setDuration(0);
       setActiveDuration(0);
       setCalories(0);
+      setPace(0);
       movingSamplesRef.current = 0;
       isMovingRef.current = false;
       setIsTracking(true);
       setLocationStatus("GPS aktif • Menunggu gerakan");
 
       startTimeRef.current = Date.now();
+
+      await saveTrackerState({
+        tracking: true,
+        activityType,
+        weight: parseFloat(weight) > 0 ? parseFloat(weight) : 60,
+        distance: 0,
+        activeDuration: 0,
+        lastLocation: firstPoint,
+        lastTimestamp: Date.now(),
+      });
 
       timerRef.current = setInterval(() => {
         if (startTimeRef.current !== null) {
@@ -627,17 +830,15 @@ export default function App() {
 
             // Abaikan lonjakan GPS yang tidak wajar.
             if (isMoving && dist <= 0.2) {
-              setDistance((prev) => {
-                const newDistance = prev + dist;
-                const currentKm = Math.floor(newDistance);
+              const newDistance = distanceRef.current + dist;
+              distanceRef.current = newDistance;
+              setDistance(newDistance);
 
-                if (currentKm > lastSpokenKmRef.current && currentKm >= 1) {
-                  lastSpokenKmRef.current = currentKm;
-                  speakDistance(currentKm);
-                }
-
-                return newDistance;
-              });
+              const currentKm = Math.floor(newDistance);
+              if (currentKm > lastSpokenKmRef.current && currentKm >= 1) {
+                lastSpokenKmRef.current = currentKm;
+                void speakDistance(currentKm);
+              }
 
               setRoute((prev) => {
                 // Hindari titik yang terlalu dekat agar garis tetap rapi.
@@ -704,6 +905,19 @@ export default function App() {
     locationSub?.remove();
     setLocationSub(null);
     lastLocation.current = null;
+    stopBackgroundLocation();
+    AsyncStorage.setItem(
+      TRACKER_STORAGE_KEY,
+      JSON.stringify({
+        tracking: false,
+        activityType,
+        weight: parseFloat(weight) > 0 ? parseFloat(weight) : 60,
+        distance,
+        activeDuration,
+        lastLocation: null,
+        lastTimestamp: null,
+      } as StoredTrackerState)
+    ).catch(() => {});
     setLocationStatus("Pelacakan dihentikan");
   };
 
@@ -711,12 +925,14 @@ export default function App() {
     stopTracking();
     startTimeRef.current = null;
     setDistance(0);
+    distanceRef.current = 0;
     lastSpokenKmRef.current = 0;
     lastHeadingRef.current = 0;
     setHeading(0);
     setDuration(0);
     setActiveDuration(0);
     setCalories(0);
+    setPace(0);
     setRoute([]);
     setCurrentLocation(null);
 
@@ -727,6 +943,8 @@ export default function App() {
       true;
     `);
 
+    AsyncStorage.removeItem(TRACKER_STORAGE_KEY).catch(() => {});
+    stopBackgroundLocation();
     setLocationStatus("Lokasi belum aktif");
   };
 
@@ -740,6 +958,95 @@ export default function App() {
       setCalories(0);
     }
   }, [activeDuration, activityType, weight]);
+
+  useEffect(() => {
+    if (!isTracking) return;
+
+    saveTrackerState({
+      tracking: true,
+      activityType,
+      weight: parseFloat(weight) > 0 ? parseFloat(weight) : 60,
+      distance,
+      activeDuration,
+      lastLocation: lastLocation.current,
+      lastTimestamp: Date.now(),
+    });
+  }, [isTracking, distance, activeDuration, activityType, weight]);
+
+  useEffect(() => {
+    if (distance <= 0 || activeDuration <= 0) {
+      setPace(0);
+      return;
+    }
+
+    if (activityType === "Bersepeda") {
+      setPace(distance / (activeDuration / 3600));
+    } else {
+      setPace((activeDuration / 60) / distance);
+    }
+  }, [distance, activeDuration, activityType]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState: AppStateStatus) => {
+      void (async () => {
+      const previousState = appStateRef.current;
+      appStateRef.current = nextState;
+
+      if (
+        previousState === "active" &&
+        (nextState === "background" || nextState === "inactive") &&
+        isTracking
+      ) {
+        await saveTrackerState({
+          tracking: true,
+          distance,
+          activeDuration,
+          lastLocation: lastLocation.current,
+          lastTimestamp: Date.now(),
+        });
+        await startBackgroundLocation();
+      }
+
+      if (
+        (previousState === "background" || previousState === "inactive") &&
+        nextState === "active" &&
+        isTracking
+      ) {
+        await stopBackgroundLocation();
+        await syncBackgroundTracker();
+
+        if (lastLocation.current) {
+          try {
+            const latest = await Location.getCurrentPositionAsync({
+              accuracy: Location.Accuracy.High,
+            });
+            const point = {
+              latitude: latest.coords.latitude,
+              longitude: latest.coords.longitude,
+            };
+            const dist = getDistance(
+              lastLocation.current.latitude,
+              lastLocation.current.longitude,
+              point.latitude,
+              point.longitude
+            );
+
+            if (dist > 0 && dist <= 0.2) {
+              const nextDistance = distanceRef.current + dist;
+              distanceRef.current = nextDistance;
+              setDistance(nextDistance);
+            }
+
+            lastLocation.current = point;
+            setCurrentLocation(point);
+          } catch {}
+        }
+      }
+      })();
+    });
+
+    return () => subscription.remove();
+  }, [isTracking, distance, activeDuration]);
 
   useEffect(() => {
     return () => {
@@ -1112,6 +1419,26 @@ export default function App() {
                 {distance.toFixed(2)}
               </Text>
               <Text style={[styles.statLabel, { color: theme.muted }]}>KM</Text>
+            </View>
+
+            <View style={styles.statBox}>
+              <FontAwesome5
+                name={activityType === "Bersepeda" ? "tachometer-alt" : "running"}
+                size={19}
+                color="#64748B"
+              />
+              <Text style={[styles.statValue, { color: theme.text }]}>
+                {activityType === "Bersepeda"
+                  ? `${pace.toFixed(1)}`
+                  : pace > 0
+                    ? `${Math.floor(pace)}:${Math.round((pace % 1) * 60)
+                        .toString()
+                        .padStart(2, "0")}`
+                    : "--"}
+              </Text>
+              <Text style={[styles.statLabel, { color: theme.muted }]}>
+                {activityType === "Bersepeda" ? "KM/JAM" : "PACE MIN/KM"}
+              </Text>
             </View>
 
             <View style={styles.statBox}>
@@ -1605,7 +1932,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   statValue: {
-    fontSize: 19,
+    fontSize: 16,
     fontWeight: "900",
     marginTop: 7,
   },
